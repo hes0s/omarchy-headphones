@@ -459,13 +459,23 @@ def sony_parse_eq(payload):
     }
 
 
-def sony_build_eq_frame(inquired, preset_key, clear_bass, bands):
-    preset_id = SONY_EQ_PRESET_IDS.get(preset_key, 0xA0)
+def sony_build_eq_preset_frame(inquired, preset_key):
+    preset_id = SONY_EQ_PRESET_IDS.get(preset_key, 0x00)
+    return bytes([EQEBB_SET_PARAM, inquired or EQ_INQUIRED_PRESET, preset_id, 0x00])
+
+
+def sony_build_eq_bands_frame(inquired, clear_bass, bands):
     cb_byte = max(0, min(20, int(clear_bass) + 10))
     band_bytes = [max(0, min(20, int(b) + 10)) for b in (bands or [0, 0, 0, 0, 0])[:5]]
     while len(band_bytes) < 5:
         band_bytes.append(10)
-    return bytes([EQEBB_SET_PARAM, inquired or EQ_INQUIRED_PRESET, preset_id, 6, cb_byte] + band_bytes)
+    return bytes([EQEBB_SET_PARAM, inquired or EQ_INQUIRED_PRESET, 0xFF, 0x06, cb_byte] + band_bytes)
+
+
+def sony_build_eq_frame(inquired, preset_key, clear_bass, bands):
+    if preset_key not in ("manual", "custom1", "custom2"):
+        return sony_build_eq_preset_frame(inquired, preset_key)
+    return sony_build_eq_bands_frame(inquired, clear_bass, bands)
 
 
 def run_sony(address, uuid, name):
@@ -863,18 +873,16 @@ def run_sony(address, uuid, name):
                     self.eq_clear_bass = curve[0]
                     self.eq_bands = list(curve[1:6])
                 self.emit_state()
-                self.push(sony_build_eq_frame(self.eq_inquired, self.eq_preset, self.eq_clear_bass, self.eq_bands))
-                self.push(bytes([EQEBB_GET_PARAM, self.eq_inquired]))
+                self.push(sony_build_eq_preset_frame(self.eq_inquired, self.eq_preset))
             elif cmd == "clearbass":
                 try:
                     cb = max(-10, min(10, int(val)))
                 except ValueError:
                     return
-                if self.eq_preset not in ("manual", "custom1", "custom2"):
-                    self.eq_preset = "manual"
+                self.eq_preset = "manual"
                 self.eq_clear_bass = cb
                 self.emit_state()
-                self.push(sony_build_eq_frame(self.eq_inquired, self.eq_preset, self.eq_clear_bass, self.eq_bands))
+                self.push(sony_build_eq_bands_frame(self.eq_inquired, self.eq_clear_bass, self.eq_bands))
             elif cmd == "eqband" and len(parts) >= 3:
                 try:
                     b_idx = int(parts[1])
@@ -882,11 +890,10 @@ def run_sony(address, uuid, name):
                 except ValueError:
                     return
                 if 0 <= b_idx < 5:
-                    if self.eq_preset not in ("manual", "custom1", "custom2"):
-                        self.eq_preset = "manual"
+                    self.eq_preset = "manual"
                     self.eq_bands[b_idx] = b_val
                     self.emit_state()
-                    self.push(sony_build_eq_frame(self.eq_inquired, self.eq_preset, self.eq_clear_bass, self.eq_bands))
+                    self.push(sony_build_eq_bands_frame(self.eq_inquired, self.eq_clear_bass, self.eq_bands))
 
     session = SonySession()
 
@@ -1248,8 +1255,10 @@ def selftest():
     assert st["mode"] == "ambient" and st["level"] == 12 and st["voice"] is True, st
 
     # Verify Sony MDR Hardware EQ build & parse
-    eq_set = sony_build_eq_frame(EQ_INQUIRED_PRESET, "bass", 7, [4, 1, 0, -2, 3])
-    assert eq_set == bytes([EQEBB_SET_PARAM, EQ_INQUIRED_PRESET, 0x16, 6, 17, 14, 11, 10, 8, 13]), eq_set
+    eq_preset_set = sony_build_eq_preset_frame(EQ_INQUIRED_PRESET, "bass")
+    assert eq_preset_set == bytes([EQEBB_SET_PARAM, EQ_INQUIRED_PRESET, 0x16, 0]), eq_preset_set
+    eq_bands_set = sony_build_eq_bands_frame(EQ_INQUIRED_PRESET, 7, [4, 1, 0, -2, 3])
+    assert eq_bands_set == bytes([EQEBB_SET_PARAM, EQ_INQUIRED_PRESET, 0xFF, 6, 17, 14, 11, 10, 8, 13]), eq_bands_set
     eq_ret_pkt = sony_encode(DATA_MDR, 1, bytes([EQEBB_RET_PARAM, EQ_INQUIRED_PRESET, 0x16, 6, 17, 14, 11, 10, 8, 13]))
     eq_dec = sony_decode(eq_ret_pkt)
     assert eq_dec is not None

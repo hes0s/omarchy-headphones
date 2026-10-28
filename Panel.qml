@@ -1026,6 +1026,7 @@ Panel {
 
                       MouseArea {
                         anchors.fill: parent
+                        preventStealing: true
                         function applyY(my) {
                           if (!root.service) return
                           var clampedY = Math.max(0, Math.min(height, my))
@@ -1036,6 +1037,10 @@ Panel {
                         onClicked: function(mouse) { applyY(mouse.y) }
                         onPositionChanged: function(mouse) {
                           if (pressed) applyY(mouse.y)
+                        }
+                        onWheel: function(wheel) {
+                          var step = wheel.angleDelta.y > 0 ? 1 : -1
+                          root.service.setEqBand(index, bandVal + step)
                         }
                       }
                     }
@@ -1121,6 +1126,7 @@ Panel {
 
               MouseArea {
                 anchors.fill: parent
+                preventStealing: true
                 function applyCbX(mx) {
                   if (!root.service) return
                   var ratio = Math.max(0, Math.min(1, mx / Math.max(1, width)))
@@ -1130,6 +1136,10 @@ Panel {
                 onClicked: function(mouse) { applyCbX(mouse.x) }
                 onPositionChanged: function(mouse) {
                   if (pressed) applyCbX(mouse.x)
+                }
+                onWheel: function(wheel) {
+                  var step = wheel.angleDelta.y > 0 ? 1 : -1
+                  root.service.setClearBass(root.eqState.clearBass + step)
                 }
               }
             }
