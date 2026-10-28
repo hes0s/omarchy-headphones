@@ -1,0 +1,1359 @@
+#!/usr/bin/python3 -I
+"""Unified Bluetooth headphone bridge for Omarchy (eh0.clock).
+
+Supports:
+  - Sony MDR v1 & v2 over BlueZ Profile1 RFCOMM (WH-1000XM4, XM5, XM6, CH720N, WF series)
+  - Apple AirPods AAP over Bluetooth L2CAP PSM 0x1001 (AirPods 1-4, Pro 1-3, Max 1-2)
+  - Google Fast Pair Service (GFPS) Message Stream over BlueZ Profile1 RFCOMM (Pixel Buds, Nothing Ear, etc.)
+
+Usage:
+  headphone-bridge --driver sony --address <MAC> [--uuid <UUID>] [--name <NAME>]
+  headphone-bridge --driver airpods --address <MAC> [--name <NAME>]
+  headphone-bridge --driver gfps --address <MAC> [--uuid <UUID>] [--name <NAME>]
+  headphone-bridge selftest
+"""
+import ctypes
+import errno
+import json
+import os
+import re
+import select
+import signal
+import socket
+import struct
+import sys
+import time
+
+ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+UUID_RE = re.compile(r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$", re.IGNORECASE)
+
+SONY_UUID_V2 = "956c7b26-d49a-4ba8-b03f-b17d393cb6e2"
+SONY_UUID_V1 = "96cc203e-5068-46ad-b32d-e316f5e069ba"
+PROFILE_PATH = "/io/github/eh0/headphones/sony"
+
+GFPS_UUID = "df21fe2c-2515-4fdb-8886-f12c4d67927c"
+PROFILE_PATH_GFPS = "/io/github/eh0/headphones/gfps"
+
+# GFPS Message Groups
+GFPS_GROUP_BLUETOOTH = 0x01
+GFPS_GROUP_COMPANION = 0x02
+GFPS_GROUP_DEVICE_INFO = 0x03
+GFPS_GROUP_DEVICE_ACTION = 0x04
+GFPS_GROUP_ACKNOWLEDGEMENT = 0xFF
+
+# GFPS Device Info Codes
+GFPS_CODE_MODEL_ID = 0x01
+GFPS_CODE_BLE_ADDRESS = 0x02
+GFPS_CODE_BATTERY = 0x03
+GFPS_CODE_BATTERY_REMAINING = 0x04
+GFPS_CODE_ACTIVE_COMPONENTS = 0x05
+
+# GFPS Device Action Codes
+GFPS_ACTION_RING = 0x01
+
+
+def arm_parent_death_signal():
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(1, signal.SIGTERM)
+    except Exception:
+        return
+    if os.getppid() == 1:
+        os._exit(0)
+
+
+def emit(payload):
+    try:
+        sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError, OSError):
+        os._exit(0)
+
+
+# ============================================================================
+# APPLE AIRPODS AAP DRIVER (L2CAP PSM 0x1001)
+# ============================================================================
+
+AAP_PSM = 0x1001
+AAP_HEADER = bytes([0x04, 0x00, 0x04, 0x00])
+AAP_HANDSHAKE = bytes([0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00] + [0x00] * 8)
+AAP_NOTIFICATIONS = AAP_HEADER + bytes([0x0F, 0x00, 0xFF, 0xFF, 0xFF, 0xFF])
+AAP_FEATURE_FLAGS = AAP_HEADER + bytes([0x4D, 0x00, 0xFF] + [0x00] * 7)
+
+AAP_MODES = {"off": 0x01, "anc": 0x02, "transparency": 0x03, "adaptive": 0x04}
+AAP_MODE_NAMES = {v: k for k, v in AAP_MODES.items()}
+AAP_COMPONENTS = {0x01: "single", 0x02: "right", 0x04: "left", 0x08: "case"}
+AAP_STATUS_CHARGING, AAP_STATUS_ABSENT = 0x01, 0x04
+
+AAP_LISTENING_MODE = 0x0D
+AAP_CONVERSATION_AWARENESS = 0x28
+AAP_ONE_BUD_ANC = 0x1B
+AAP_ADAPTIVE_LEVEL = 0x2E
+AAP_TOGGLE_STATES = {0x01: True, 0x02: False}
+AAP_OP_BATTERY, AAP_OP_EAR, AAP_OP_CONTROL, AAP_OP_INFO = 0x04, 0x06, 0x09, 0x1D
+AAP_EAR_STATES = {0x00: "in_ear", 0x01: "out_of_ear", 0x02: "in_case", 0x03: "disconnected"}
+
+
+def aap_control_packet(identifier, value):
+    return AAP_HEADER + bytes([0x09, 0x00, identifier, value, 0, 0, 0])
+
+
+def aap_parse_packet(packet, state):
+    if not packet.startswith(AAP_HEADER) or len(packet) < 6:
+        return
+    payload = packet[4:]
+    opcode = payload[0]
+
+    if opcode == AAP_OP_BATTERY:
+        count = payload[2]
+        if len(payload) < 3 + count * 5:
+            return
+        for i in range(count):
+            comp, _, level, status = payload[3 + i * 5:7 + i * 5]
+            cname = AAP_COMPONENTS.get(comp)
+            if not cname:
+                continue
+            val = None if (status == AAP_STATUS_ABSENT or level > 100) else int(level)
+            state["battery"][cname] = val
+            state["charging"][cname] = (status == AAP_STATUS_CHARGING)
+            if cname in ("left", "right"):
+                state["battery"]["perBud"] = True
+
+    elif opcode == AAP_OP_EAR and len(payload) >= 4:
+        state["ear"] = [AAP_EAR_STATES.get(payload[2]), AAP_EAR_STATES.get(payload[3])]
+
+    elif opcode == AAP_OP_INFO and len(payload) >= 8:
+        fields = [
+            t for t in (c.decode("utf-8", errors="ignore") for c in payload[4:].split(b"\x00"))
+            if len(t) >= 2 and t.isprintable()
+        ]
+        if fields:
+            state["name"] = fields[0][:60]
+        if len(fields) > 1:
+            state["model"] = fields[1][:24]
+            if "max" in state["name"].lower():
+                state["form"] = "overear"
+                state["battery"]["perBud"] = False
+                state["battery"]["hasCase"] = False
+
+    elif opcode == AAP_OP_CONTROL and len(payload) >= 7:
+        ident = payload[2]
+        val = payload[3]
+        if ident == AAP_LISTENING_MODE:
+            m = AAP_MODE_NAMES.get(val)
+            if m:
+                state["mode"] = m
+        elif ident == AAP_CONVERSATION_AWARENESS:
+            state["ca"] = AAP_TOGGLE_STATES.get(val)
+        elif ident == AAP_ONE_BUD_ANC:
+            state["onebud"] = AAP_TOGGLE_STATES.get(val)
+        elif ident == AAP_ADAPTIVE_LEVEL:
+            state["adaptive_level"] = min(100, max(0, int(val)))
+
+
+def aap_build_line(state):
+    is_max = state["form"] == "overear"
+    modes = ["off", "transparency", "adaptive", "anc"]
+    if state.get("model") in ("A3063", "A3064", "A3065"):
+        modes = ["transparency", "adaptive", "anc"]
+
+    toggles = []
+    if state["ca"] is not None or state["mode"] in ("adaptive", "anc", "transparency"):
+        toggles.append({"key": "ca", "label": "Conversation awareness", "value": bool(state["ca"])})
+    if not is_max:
+        toggles.append({"key": "onebud", "label": "One-bud noise control", "value": bool(state["onebud"])})
+
+    level = None
+    if state["mode"] == "adaptive":
+        lvl = state["adaptive_level"] if state["adaptive_level"] is not None else 50
+        level = {"key": "adaptive", "label": "Adaptive noise level", "value": lvl, "min": 0, "max": 100}
+
+    return {
+        "connected": True,
+        "connecting": False,
+        "notSetUp": False,
+        "busy": False,
+        "address": state["address"],
+        "name": state["name"],
+        "brand": "Apple",
+        "form": state["form"],
+        "driver": "airpods",
+        "driverLabel": "APPLE AAP",
+        "battery": state["battery"],
+        "charging": state["charging"],
+        "modes": modes,
+        "mode": state["mode"] or "anc",
+        "level": level,
+        "toggles": toggles,
+        "ear": state["ear"],
+    }
+
+
+def aap_apply_command(sock, state, line):
+    parts = line.strip().split()
+    if len(parts) < 2:
+        return
+    cmd, val = parts[0], parts[1]
+    if cmd == "set" and val in AAP_MODES:
+        sock.send(aap_control_packet(AAP_LISTENING_MODE, AAP_MODES[val]))
+        state["mode"] = val
+    elif cmd == "ca" and val in ("on", "off"):
+        sock.send(aap_control_packet(AAP_CONVERSATION_AWARENESS, 0x01 if val == "on" else 0x02))
+        state["ca"] = (val == "on")
+    elif cmd == "onebud" and val in ("on", "off"):
+        sock.send(aap_control_packet(AAP_ONE_BUD_ANC, 0x01 if val == "on" else 0x02))
+        state["onebud"] = (val == "on")
+    elif cmd == "adaptive" and val.isdigit():
+        num = min(100, max(0, int(val)))
+        sock.send(aap_control_packet(AAP_ADAPTIVE_LEVEL, num))
+        state["adaptive_level"] = num
+
+
+def run_airpods(address, name):
+    form = "overear" if "max" in name.lower() else "earbuds"
+    state = {
+        "address": address,
+        "name": name or "AirPods",
+        "model": "",
+        "form": form,
+        "mode": None,
+        "battery": {"single": None, "left": None, "right": None, "case": None, "perBud": form == "earbuds", "hasCase": form == "earbuds"},
+        "charging": {"single": False, "left": False, "right": False, "case": False},
+        "ear": None,
+        "ca": None,
+        "onebud": None,
+        "adaptive_level": 50,
+    }
+    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+    sock.settimeout(5.0)
+    try:
+        sock.connect((address, AAP_PSM))
+        sock.send(AAP_HANDSHAKE)
+        time.sleep(0.25)
+        sock.send(AAP_FEATURE_FLAGS)
+        time.sleep(0.25)
+        sock.send(AAP_NOTIFICATIONS)
+        sock.settimeout(None)
+    except OSError as exc:
+        sock.close()
+        if exc.errno in (errno.ECONNREFUSED, errno.EACCES, errno.EPERM):
+            emit({
+                "connected": True,
+                "notSetUp": True,
+                "address": address,
+                "name": name or "AirPods",
+                "brand": "Apple",
+                "form": form,
+                "driver": "airpods",
+                "driverLabel": "APPLE AAP",
+                "modes": [],
+            })
+            sys.exit(3)
+        emit({"connected": True, "busy": True, "error": str(exc)})
+        sys.exit(1)
+
+    pending = ""
+    last_emitted = ""
+    with sock:
+        while True:
+            ready, _, _ = select.select([sock, 0], [], [], 2.0)
+            for src in ready:
+                if src is sock:
+                    pkt = sock.recv(1024)
+                    if not pkt:
+                        sys.exit(1)
+                    aap_parse_packet(pkt, state)
+                elif src == 0:
+                    chunk = os.read(0, 1024)
+                    if not chunk:
+                        sys.exit(0)
+                    pending += chunk.decode("utf-8", errors="ignore")
+                    while "\n" in pending:
+                        cmd_line, pending = pending.split("\n", 1)
+                        aap_apply_command(sock, state, cmd_line)
+            out = aap_build_line(state)
+            serialized = json.dumps(out, sort_keys=True)
+            if serialized != last_emitted:
+                last_emitted = serialized
+                emit(out)
+
+
+# ============================================================================
+# SONY MDR V1 & V2 DRIVER (RFCOMM via BlueZ Profile1)
+# ============================================================================
+
+HDR, TRL, ESC, MASK = 0x3E, 0x3C, 0x3D, 0xEF
+DATA_MDR, DATA_MDR_NO2, ACK = 0x0C, 0x0E, 0x01
+CONNECT_RET_PROTOCOL_INFO = 0x01
+EQEBB_GET_PARAM, EQEBB_RET_PARAM, EQEBB_SET_PARAM, EQEBB_NTFY_PARAM = 0x56, 0x57, 0x58, 0x59
+EQ_INQUIRED_PRESET = 0x01
+EQ_INQUIRED_CUSTOM_V2 = 0x04
+NCASM_GET, NCASM_RET, NCASM_SET, NCASM_NTFY = 0x66, 0x67, 0x68, 0x69
+SYSTEM_GET_STATUS, SYSTEM_RET_STATUS, SYSTEM_NTFY_STATUS = 0xF2, 0xF3, 0xF5
+SYSTEM_GET_PARAM, SYSTEM_RET_PARAM, SYSTEM_SET_PARAM, SYSTEM_NTFY_PARAM = 0xF6, 0xF7, 0xF8, 0xF9
+WEARING_STATUS_TYPE = 0x10
+PARAM_CONTROL_BY_WEARING_V1 = 0x03
+
+SONY_EQ_PRESET_IDS = {
+    "off": 0x00,
+    "rock": 0x01,
+    "pop": 0x02,
+    "jazz": 0x03,
+    "dance": 0x04,
+    "edm": 0x05,
+    "rnb": 0x06,
+    "acoustic": 0x07,
+    "bright": 0x10,
+    "excited": 0x11,
+    "mellow": 0x12,
+    "relaxed": 0x13,
+    "vocal": 0x14,
+    "treble": 0x15,
+    "bass": 0x16,
+    "speech": 0x17,
+    "manual": 0xA0,
+    "custom1": 0xA1,
+    "custom2": 0xA2,
+}
+SONY_EQ_ID_TO_KEY = {v: k for k, v in SONY_EQ_PRESET_IDS.items()}
+
+# Standard Sony curves: [clearBass, 400Hz, 1kHz, 2.5kHz, 6.3kHz, 16kHz]
+SONY_EQ_CURVES = {
+    "off":     [0, 0, 0, 0, 0, 0],
+    "bright":  [0, 0, 1, 2, 4, 6],
+    "excited": [5, 2, 0, -2, 2, 5],
+    "mellow":  [1, 0, -1, -2, -4, -5],
+    "relaxed": [0, 1, -1, -2, -3, -4],
+    "vocal":   [-2, -2, 2, 4, 3, 0],
+    "treble":  [0, 0, 0, 2, 5, 7],
+    "bass":    [7, 4, 1, 0, 0, 0],
+    "speech":  [-4, -2, 3, 5, 3, -1],
+}
+
+CANDIDATES_V2 = (0x17, 0x15, 0x22)
+CANDIDATES_V1 = (0x02,)
+CANDIDATES = CANDIDATES_V2 + CANDIDATES_V1
+
+AVAILABLE_MODES = {
+    0x17: ["off", "anc", "ambient"],
+    0x15: ["off", "anc", "ambient"],
+    0x22: ["off", "ambient"],
+    0x19: ["off", "anc", "ambient"],
+    0x02: ["off", "anc", "ambient"],
+}
+
+
+def sony_escape(data):
+    out = bytearray()
+    for b in data:
+        if b in (HDR, TRL, ESC):
+            out += bytes([ESC, b & MASK])
+        else:
+            out.append(b)
+    return bytes(out)
+
+
+def sony_unescape(data):
+    out, idx = bytearray(), 0
+    while idx < len(data):
+        if data[idx] == ESC:
+            idx += 1
+            if idx >= len(data):
+                break
+            out.append(data[idx] | 0x10)
+        else:
+            out.append(data[idx])
+        idx += 1
+    return bytes(out)
+
+
+def sony_encode(dtype, seq, payload=b""):
+    body = bytes([dtype, seq]) + struct.pack(">I", len(payload)) + payload
+    return bytes([HDR]) + sony_escape(body + bytes([sum(body) & 0xFF])) + bytes([TRL])
+
+
+def sony_decode(frame):
+    if len(frame) < 9 or frame[0] != HDR or frame[-1] != TRL:
+        return None
+    msg = sony_unescape(frame[1:-1])
+    if len(msg) < 7:
+        return None
+    dtype, seq = msg[0], msg[1]
+    length = struct.unpack(">I", msg[2:6])[0]
+    if len(msg) != 6 + length + 1:
+        return None
+    payload, cksum = msg[6:6 + length], msg[6 + length]
+    if cksum != (sum(msg[:6 + length]) & 0xFF):
+        return None
+    return dtype, seq, payload
+
+
+def sony_parse_ncasm(payload, expect=None):
+    if len(payload) < 2 or payload[0] not in (NCASM_RET, NCASM_NTFY):
+        return None
+    inquired = payload[1]
+    if expect is not None and inquired != expect and not (expect == 0x17 and inquired == 0x19):
+        return None
+    if inquired in CANDIDATES_V1:
+        if len(payload) < 8:
+            return None
+        on = payload[2] == 0x01
+        nc_val = payload[4]
+        return {
+            "inquired": inquired,
+            "mode": "off" if not on else ("ambient" if nc_val == 0x00 else "anc"),
+            "voice": payload[6] == 0x01,
+            "level": max(1, min(20, int(payload[7]))) if payload[7] > 0 else 10,
+            "ncValue": payload[3],
+        }
+    if inquired in CANDIDATES_V2 or inquired == 0x19:
+        if inquired == 0x19:
+            if len(payload) < 9:
+                return None
+            return {
+                "inquired": inquired,
+                "mode": "off" if payload[3] != 0x01 else ("ambient" if payload[4] == 0x01 else "anc"),
+                "voice": payload[5] == 0x01,
+                "level": max(1, min(20, int(payload[6]))),
+                "ncValue": None,
+            }
+        if len(payload) < 6:
+            return None
+        on = payload[3] == 0x01
+        ambient = True if inquired == 0x22 else (len(payload) > 4 and payload[4] == 0x01)
+        return {
+            "inquired": inquired,
+            "mode": "off" if not on else ("ambient" if ambient else "anc"),
+            "voice": payload[-2] == 0x01,
+            "level": max(1, min(20, int(payload[-1]))),
+            "ncValue": payload[5] if inquired == 0x15 and len(payload) > 7 else None,
+        }
+    return None
+
+
+def sony_parse_eq(payload):
+    if len(payload) < 4 or payload[0] not in (EQEBB_RET_PARAM, EQEBB_NTFY_PARAM):
+        return None
+    inquired = payload[1]
+    if inquired not in (EQ_INQUIRED_PRESET, EQ_INQUIRED_CUSTOM_V2):
+        return None
+    preset_id = payload[2]
+    preset_key = SONY_EQ_ID_TO_KEY.get(preset_id, "manual")
+    count = payload[3]
+    raw_vals = [max(-10, min(10, int(b) - 10)) for b in payload[4:4 + count] if 0 <= int(b) <= 20]
+    if len(raw_vals) >= 6:
+        clear_bass = raw_vals[0]
+        bands = raw_vals[1:6]
+    elif len(raw_vals) == 5:
+        clear_bass = 0
+        bands = raw_vals[:5]
+    else:
+        curve = SONY_EQ_CURVES.get(preset_key, [0, 0, 0, 0, 0, 0])
+        clear_bass = curve[0]
+        bands = list(curve[1:6])
+    return {
+        "inquired": inquired,
+        "preset": preset_key,
+        "clearBass": clear_bass,
+        "bands": bands,
+    }
+
+
+def sony_build_eq_frame(inquired, preset_key, clear_bass, bands):
+    preset_id = SONY_EQ_PRESET_IDS.get(preset_key, 0xA0)
+    cb_byte = max(0, min(20, int(clear_bass) + 10))
+    band_bytes = [max(0, min(20, int(b) + 10)) for b in (bands or [0, 0, 0, 0, 0])[:5]]
+    while len(band_bytes) < 5:
+        band_bytes.append(10)
+    return bytes([EQEBB_SET_PARAM, inquired or EQ_INQUIRED_PRESET, preset_id, 6, cb_byte] + band_bytes)
+
+
+def run_sony(address, uuid, name):
+    try:
+        import dbus
+        import dbus.mainloop.glib
+        import dbus.service
+        from gi.repository import GLib
+    except ImportError as exc:
+        emit({"connected": True, "busy": True, "error": f"Missing python-dbus/PyGObject: {exc}"})
+        sys.exit(4)
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    loop = GLib.MainLoop()
+
+    drv_label = "SONY MDR V1" if uuid.lower() == SONY_UUID_V1 else "SONY MDR V2"
+    form = "earbuds" if "wf-" in name.lower() else "overear"
+
+    class SonySession:
+        def __init__(self):
+            self.fd = None
+            self.watch = None
+            self.registered = False
+            self.manager = None
+            self.device = None
+            self.buffer = bytearray()
+            self.seq = 0
+            self.waiting = False
+            self.sent = 0
+            self.queue = []
+            self.protocol_seen = False
+            self.inquired = None
+            self.candidates = CANDIDATES_V1 + CANDIDATES_V2 if uuid.lower() == SONY_UUID_V1 else CANDIDATES_V2 + CANDIDATES_V1
+            self.candidate_idx = 0
+            self.mode = "anc"
+            self.level = 12
+            self.ambient_level = 12
+            self.voice = False
+            self.nc_value = 0x02
+            self.worn = None
+            self.pause_on_wear = True
+            self.eq_inquired = EQ_INQUIRED_PRESET
+            self.eq_preset = "off"
+            self.eq_clear_bass = 0
+            self.eq_bands = [0, 0, 0, 0, 0]
+            self.pending_stdin = ""
+            self.pending_cmds = []
+            self.exit_code = None
+
+        def finish(self, code, busy=False, err=""):
+            if self.exit_code is not None:
+                return False
+            self.exit_code = code
+            if busy or err:
+                emit({
+                    "connected": True,
+                    "busy": busy,
+                    "error": err,
+                    "address": address,
+                    "name": name or "Sony Headphones",
+                    "brand": "Sony",
+                    "form": form,
+                    "driver": "sony",
+                    "driverLabel": drv_label,
+                })
+            loop.quit()
+            return False
+
+        def cleanup(self):
+            if self.watch is not None:
+                try:
+                    GLib.source_remove(self.watch)
+                except Exception:
+                    pass
+                self.watch = None
+            if self.fd is not None:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
+            if self.manager is not None and self.registered:
+                try:
+                    self.manager.UnregisterProfile(PROFILE_PATH, timeout=3)
+                except Exception:
+                    pass
+                self.registered = False
+
+        def start(self):
+            objs = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager").GetManagedObjects()
+            dev_path = None
+            for path, ifaces in objs.items():
+                d = ifaces.get("org.bluez.Device1")
+                if d and str(d.get("Address", "")).upper() == address.upper():
+                    dev_path = str(path)
+                    break
+            if not dev_path:
+                return self.finish(1, busy=True, err="Device not found on BlueZ")
+
+            self.device = dbus.Interface(bus.get_object("org.bluez", dev_path), "org.bluez.Device1")
+            self.manager = dbus.Interface(bus.get_object("org.bluez", "/org/bluez"), "org.bluez.ProfileManager1")
+            try:
+                self.manager.RegisterProfile(PROFILE_PATH, uuid, {
+                    "Name": "Omarchy Headphones Sony",
+                    "Role": "client",
+                    "RequireAuthentication": dbus.Boolean(False),
+                    "RequireAuthorization": dbus.Boolean(False),
+                }, timeout=5)
+            except Exception as exc:
+                return self.finish(1, busy=True, err=str(exc))
+
+            self.registered = True
+            GLib.timeout_add(400, self.connect_profile, 0)
+            return False
+
+        def connect_profile(self, attempt):
+            if self.exit_code is not None or self.fd is not None:
+                return False
+
+            def on_err(err):
+                if self.exit_code is not None or self.fd is not None:
+                    return
+                if attempt + 1 < 6:
+                    GLib.timeout_add(1200, self.connect_profile, attempt + 1)
+                else:
+                    self.finish(1, busy=True, err=str(err))
+
+            try:
+                self.device.ConnectProfile(uuid, reply_handler=lambda: None, error_handler=on_err, timeout=20)
+            except Exception as exc:
+                on_err(exc)
+            return False
+
+        def opened(self, fd):
+            if self.fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                return
+            self.fd = fd
+            self.watch = GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.on_io)
+            self.send_init(1)
+
+        def send_init(self, attempt):
+            if self.exit_code is not None or self.protocol_seen:
+                return False
+            if attempt > 3:
+                return self.finish(1, busy=True, err="Headset did not answer MDR handshake")
+            self.waiting = False
+            self.queue = []
+            self.write_raw(sony_encode(DATA_MDR, self.seq, b"\x00\x00"))
+            GLib.timeout_add(2000, self.send_init, attempt + 1)
+            return False
+
+        def probe(self, idx):
+            if self.exit_code is not None or self.inquired is not None:
+                return False
+            if idx >= len(self.candidates):
+                return self.finish(3)
+            self.candidate_idx = idx
+            self.push(bytes([NCASM_GET, self.candidates[idx]]))
+            GLib.timeout_add(2500, self.next_candidate, idx)
+            return False
+
+        def next_candidate(self, idx):
+            if self.inquired is None and self.candidate_idx == idx:
+                self.probe(idx + 1)
+            return False
+
+        def write_raw(self, frame):
+            if self.fd is None:
+                return
+            try:
+                os.write(self.fd, frame)
+            except OSError:
+                self.finish(1)
+
+        def push(self, payload):
+            self.queue.append(payload)
+            self.pump()
+
+        def pump(self):
+            if self.waiting or not self.queue or self.fd is None:
+                return
+            payload = self.queue.pop(0)
+            self.waiting = True
+            self.sent += 1
+            serial = self.sent
+            self.write_raw(sony_encode(DATA_MDR, self.seq, payload))
+            GLib.timeout_add(2500, self.on_ack_timeout, serial)
+
+        def on_ack_timeout(self, serial):
+            if self.waiting and self.sent == serial:
+                self.waiting = False
+                self.pump()
+            return False
+
+        def on_io(self, _fd, cond):
+            if cond & (GLib.IO_HUP | GLib.IO_ERR):
+                self.finish(1)
+                return False
+            try:
+                data = os.read(self.fd, 4096)
+            except OSError:
+                self.finish(1)
+                return False
+            if not data:
+                self.finish(1)
+                return False
+            self.buffer += data
+            while True:
+                start = self.buffer.find(HDR)
+                if start < 0:
+                    self.buffer.clear()
+                    break
+                end = self.buffer.find(TRL, start + 1)
+                if end < 0:
+                    del self.buffer[:start]
+                    break
+                frame = bytes(self.buffer[start:end + 1])
+                del self.buffer[:end + 1]
+                self.on_frame(frame)
+            return self.exit_code is None
+
+        def on_frame(self, frame):
+            dec = sony_decode(frame)
+            if dec is None:
+                return
+            dtype, seq, payload = dec
+            if dtype == ACK:
+                self.seq = seq
+                self.waiting = False
+                self.pump()
+                return
+            if dtype in (DATA_MDR, DATA_MDR_NO2):
+                self.write_raw(sony_encode(ACK, 1 - seq))
+            if not payload:
+                return
+            if payload[0] == CONNECT_RET_PROTOCOL_INFO:
+                if not self.protocol_seen:
+                    self.protocol_seen = True
+                    self.probe(0)
+                    self.push(bytes([SYSTEM_GET_STATUS, WEARING_STATUS_TYPE]))
+                    if uuid.lower() == SONY_UUID_V1:
+                        self.push(bytes([SYSTEM_GET_PARAM, PARAM_CONTROL_BY_WEARING_V1]))
+                        self.push(bytes([EQEBB_GET_PARAM, EQ_INQUIRED_PRESET]))
+                    else:
+                        self.push(bytes([EQEBB_GET_PARAM, EQ_INQUIRED_CUSTOM_V2]))
+                        self.push(bytes([EQEBB_GET_PARAM, EQ_INQUIRED_PRESET]))
+                return
+            st = sony_parse_ncasm(payload, self.inquired)
+            if st is not None:
+                was_none = (self.inquired is None)
+                self.inquired = st["inquired"]
+                self.mode = st["mode"]
+                if st["level"] > 0:
+                    self.level = st["level"]
+                    self.ambient_level = st["level"]
+                self.voice = st["voice"]
+                if st["ncValue"] is not None:
+                    self.nc_value = st["ncValue"]
+                self.emit_state()
+                if was_none and self.pending_cmds:
+                    queued = list(self.pending_cmds)
+                    self.pending_cmds.clear()
+                    for cmd_line in queued:
+                        self.handle_cmd(cmd_line)
+                return
+            eq_st = sony_parse_eq(payload)
+            if eq_st is not None:
+                self.eq_inquired = eq_st["inquired"]
+                self.eq_preset = eq_st["preset"]
+                self.eq_clear_bass = eq_st["clearBass"]
+                self.eq_bands = eq_st["bands"]
+                if self.inquired is not None:
+                    self.emit_state()
+            elif len(payload) >= 4 and payload[0] in (SYSTEM_RET_PARAM, SYSTEM_NTFY_PARAM) and payload[1] == PARAM_CONTROL_BY_WEARING_V1:
+                self.pause_on_wear = (payload[-1] == 0x01)
+                if self.inquired is not None:
+                    self.emit_state()
+            elif len(payload) >= 3 and payload[0] in (SYSTEM_RET_STATUS, SYSTEM_NTFY_STATUS) and payload[1] == WEARING_STATUS_TYPE:
+                self.worn = (payload[-1] == 0x00)
+                if self.inquired is not None:
+                    self.emit_state()
+
+        def emit_state(self):
+            modes = AVAILABLE_MODES.get(self.inquired, ["off", "anc", "ambient"])
+            lvl_obj = None
+            if self.mode == "ambient":
+                lvl_obj = {"key": "level", "label": "Ambient level", "value": self.level, "min": 1, "max": 20}
+            toggles = [
+                {"key": "voice", "label": "Focus on voice", "value": self.voice},
+                {"key": "pauseOnEar", "label": "Pause when taken off", "value": self.pause_on_wear},
+            ]
+            out = {
+                "connected": True,
+                "connecting": False,
+                "busy": False,
+                "notSetUp": False,
+                "address": address,
+                "name": name or "Sony Headphones",
+                "brand": "Sony",
+                "form": form,
+                "driver": "sony",
+                "driverLabel": drv_label,
+                "modes": modes,
+                "mode": self.mode,
+                "level": lvl_obj,
+                "toggles": toggles,
+                "eq": {
+                    "available": True,
+                    "preset": self.eq_preset,
+                    "clearBass": self.eq_clear_bass,
+                    "bands": list(self.eq_bands),
+                },
+            }
+            if self.worn is not None:
+                out["worn"] = self.worn
+            emit(out)
+
+        def build_set_frame(self, mode, level, voice):
+            on = 1 if mode != "off" else 0
+            ambient = 1 if mode == "ambient" else 0
+            lvl = max(1, min(20, int(level)))
+            v_flag = 1 if voice else 0
+            if self.inquired == 0x02:
+                if mode == "ambient":
+                    return bytes([NCASM_SET, 0x02, 0x11, 0x01, 0x00, 0x01, v_flag, lvl])
+                return bytes([NCASM_SET, 0x02, 0x11 if on else 0x00, 0x01, 0x02 if on else 0x00, 0x01, v_flag, 0x00])
+            if self.inquired == 0x15:
+                return bytes([NCASM_SET, 0x15, 0x01, on, ambient, self.nc_value, v_flag, lvl])
+            if self.inquired == 0x22:
+                return bytes([NCASM_SET, 0x22, 0x01, on, v_flag, lvl])
+            return bytes([NCASM_SET, 0x17, 0x01, on, ambient, v_flag, lvl])
+
+        def on_stdin(self, _fd, cond):
+            if cond & (GLib.IO_HUP | GLib.IO_ERR):
+                self.finish(0)
+                return False
+            try:
+                chunk = os.read(0, 1024)
+            except OSError:
+                self.finish(0)
+                return False
+            if not chunk:
+                self.finish(0)
+                return False
+            self.pending_stdin += chunk.decode("utf-8", errors="ignore")
+            while "\n" in self.pending_stdin:
+                line, self.pending_stdin = self.pending_stdin.split("\n", 1)
+                self.handle_cmd(line)
+            return True
+
+        def handle_cmd(self, line):
+            parts = line.strip().split()
+            if len(parts) < 2:
+                return
+            if self.inquired is None:
+                if len(self.pending_cmds) < 8:
+                    self.pending_cmds.append(line)
+                return
+            cmd, val = parts[0], parts[1]
+            avail = AVAILABLE_MODES.get(self.inquired, ["off", "anc", "ambient"])
+            if cmd == "set" and val in avail:
+                lvl = self.ambient_level if val == "ambient" else self.level
+                self.mode = val
+                self.emit_state()
+                self.push(self.build_set_frame(val, lvl, self.voice))
+            elif cmd == "level" and val.isdigit():
+                lvl = max(1, min(20, int(val)))
+                self.level = lvl
+                self.ambient_level = lvl
+                self.mode = "ambient"
+                self.emit_state()
+                self.push(self.build_set_frame("ambient", lvl, self.voice))
+            elif cmd == "voice" and val in ("on", "off"):
+                self.voice = (val == "on")
+                if self.voice and self.mode != "ambient":
+                    self.mode = "ambient"
+                self.emit_state()
+                lvl = self.ambient_level if self.mode == "ambient" else self.level
+                self.push(self.build_set_frame(self.mode or "ambient", lvl, self.voice))
+            elif cmd.lower() == "pauseonear" and val in ("on", "off"):
+                self.pause_on_wear = (val == "on")
+                self.emit_state()
+                val_byte = 0x01 if val == "on" else 0x00
+                if uuid.lower() == SONY_UUID_V1:
+                    self.push(bytes([SYSTEM_SET_PARAM, PARAM_CONTROL_BY_WEARING_V1, 0x00, val_byte]))
+            elif cmd == "eqpreset" and val in SONY_EQ_PRESET_IDS:
+                self.eq_preset = val
+                if val in SONY_EQ_CURVES:
+                    curve = SONY_EQ_CURVES[val]
+                    self.eq_clear_bass = curve[0]
+                    self.eq_bands = list(curve[1:6])
+                self.emit_state()
+                self.push(sony_build_eq_frame(self.eq_inquired, self.eq_preset, self.eq_clear_bass, self.eq_bands))
+                self.push(bytes([EQEBB_GET_PARAM, self.eq_inquired]))
+            elif cmd == "clearbass":
+                try:
+                    cb = max(-10, min(10, int(val)))
+                except ValueError:
+                    return
+                if self.eq_preset not in ("manual", "custom1", "custom2"):
+                    self.eq_preset = "manual"
+                self.eq_clear_bass = cb
+                self.emit_state()
+                self.push(sony_build_eq_frame(self.eq_inquired, self.eq_preset, self.eq_clear_bass, self.eq_bands))
+            elif cmd == "eqband" and len(parts) >= 3:
+                try:
+                    b_idx = int(parts[1])
+                    b_val = max(-10, min(10, int(parts[2])))
+                except ValueError:
+                    return
+                if 0 <= b_idx < 5:
+                    if self.eq_preset not in ("manual", "custom1", "custom2"):
+                        self.eq_preset = "manual"
+                    self.eq_bands[b_idx] = b_val
+                    self.emit_state()
+                    self.push(sony_build_eq_frame(self.eq_inquired, self.eq_preset, self.eq_clear_bass, self.eq_bands))
+
+    session = SonySession()
+
+    class Profile(dbus.service.Object):
+        @dbus.service.method("org.bluez.Profile1", in_signature="", out_signature="")
+        def Release(self):
+            session.finish(1)
+
+        @dbus.service.method("org.bluez.Profile1", in_signature="oha{sv}", out_signature="")
+        def NewConnection(self, path, fd, properties):
+            session.opened(fd.take())
+
+        @dbus.service.method("org.bluez.Profile1", in_signature="o", out_signature="")
+        def RequestDisconnection(self, path):
+            session.finish(1)
+
+    Profile(bus, PROFILE_PATH)
+    GLib.io_add_watch(0, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, session.on_stdin)
+    session.start()
+
+    try:
+        if session.exit_code is None:
+            loop.run()
+    finally:
+        session.cleanup()
+    sys.exit(session.exit_code or 0)
+
+
+# ============================================================================
+# GOOGLE FAST PAIR SERVICE (GFPS) DRIVER (RFCOMM via BlueZ Profile1)
+# ============================================================================
+
+def gfps_encode(group, code, payload=b""):
+    return bytes([group, code]) + struct.pack(">H", len(payload)) + payload
+
+
+def gfps_decode_battery_byte(byte_val):
+    if byte_val is None:
+        return None, False
+    if (byte_val & 0x7F) == 0x7F:
+        return None, False
+    level = int(byte_val & 0x7F)
+    charging = bool(byte_val & 0x80)
+    return level, charging
+
+
+def gfps_parse_frame(group, code, payload, state):
+    if group == GFPS_GROUP_DEVICE_INFO:
+        if code == GFPS_CODE_MODEL_ID and len(payload) >= 3:
+            state["model_id"] = payload[:3].hex().upper()
+        elif code == GFPS_CODE_BLE_ADDRESS and len(payload) >= 6:
+            state["ble_address"] = ":".join(f"{b:02X}" for b in payload[:6])
+        elif code == GFPS_CODE_BATTERY:
+            if len(payload) == 1:
+                lvl, chg = gfps_decode_battery_byte(payload[0])
+                state["battery"]["single"] = lvl
+                state["battery"]["left"] = None
+                state["battery"]["right"] = None
+                state["battery"]["case"] = None
+                state["battery"]["perBud"] = False
+                state["battery"]["hasCase"] = False
+                state["charging"]["single"] = chg
+                state["charging"]["left"] = False
+                state["charging"]["right"] = False
+                state["charging"]["case"] = False
+            elif len(payload) >= 3:
+                l_lvl, l_chg = gfps_decode_battery_byte(payload[0])
+                r_lvl, r_chg = gfps_decode_battery_byte(payload[1])
+                c_lvl, c_chg = gfps_decode_battery_byte(payload[2])
+                state["battery"]["left"] = l_lvl
+                state["battery"]["right"] = r_lvl
+                state["battery"]["case"] = c_lvl
+                state["battery"]["single"] = None
+                state["battery"]["perBud"] = True
+                state["battery"]["hasCase"] = True
+                state["charging"]["left"] = l_chg
+                state["charging"]["right"] = r_chg
+                state["charging"]["case"] = c_chg
+        elif code == GFPS_CODE_ACTIVE_COMPONENTS and len(payload) >= 1:
+            state["active_components"] = int(payload[0])
+    elif group == GFPS_GROUP_DEVICE_ACTION:
+        if code == GFPS_ACTION_RING and len(payload) >= 1:
+            state["ringing"] = int(payload[0])
+
+
+def gfps_feed_data(buffer, chunk):
+    buf = buffer + chunk
+    frames = []
+    while len(buf) >= 4:
+        group, code = buf[0], buf[1]
+        length = struct.unpack(">H", buf[2:4])[0]
+        if len(buf) < 4 + length:
+            break
+        payload = bytes(buf[4:4 + length])
+        frames.append((group, code, payload))
+        buf = buf[4 + length:]
+    return frames, buf
+
+
+def gfps_build_line(state):
+    return {
+        "connected": True,
+        "connecting": False,
+        "busy": False,
+        "notSetUp": False,
+        "address": state["address"],
+        "name": state["name"],
+        "brand": state.get("brand") or "Fast Pair",
+        "form": state["form"],
+        "driver": "gfps",
+        "driverLabel": "FAST PAIR",
+        "battery": state["battery"],
+        "charging": state["charging"],
+        "modes": [],
+        "toggles": [],
+    }
+
+
+def run_gfps(address, uuid, name):
+    try:
+        import dbus
+        import dbus.mainloop.glib
+        import dbus.service
+        from gi.repository import GLib
+    except ImportError as exc:
+        emit({"connected": True, "busy": True, "error": f"Missing python-dbus/PyGObject: {exc}"})
+        sys.exit(4)
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    loop = GLib.MainLoop()
+
+    lower_name = (name or "").lower()
+    form = "earbuds" if any(w in lower_name for w in ("bud", "pod", "ear", "tws", "wf-")) else "overear"
+    brand = "Google" if "pixel" in lower_name else ("Nothing" if "nothing" in lower_name else ("OnePlus" if "oneplus" in lower_name else "Fast Pair"))
+
+    class GfpsSession:
+        def __init__(self):
+            self.fd = None
+            self.watch = None
+            self.registered = False
+            self.manager = None
+            self.device = None
+            self.buffer = bytearray()
+            self.exit_code = None
+            self.pending_stdin = ""
+            self.state = {
+                "address": address,
+                "name": name or "Fast Pair Headset",
+                "brand": brand,
+                "form": form,
+                "battery": {
+                    "single": None,
+                    "left": None,
+                    "right": None,
+                    "case": None,
+                    "perBud": form == "earbuds",
+                    "hasCase": form == "earbuds",
+                },
+                "charging": {
+                    "single": False,
+                    "left": False,
+                    "right": False,
+                    "case": False,
+                },
+                "model_id": "",
+                "ble_address": "",
+            }
+
+        def finish(self, code, busy=False, err=""):
+            if self.exit_code is not None:
+                return False
+            self.exit_code = code
+            if busy or err:
+                emit({
+                    "connected": True,
+                    "busy": busy,
+                    "error": err,
+                    "address": address,
+                    "name": name or "Fast Pair Headset",
+                    "brand": brand,
+                    "form": form,
+                    "driver": "gfps",
+                    "driverLabel": "FAST PAIR",
+                })
+            loop.quit()
+            return False
+
+        def cleanup(self):
+            if self.watch is not None:
+                try:
+                    GLib.source_remove(self.watch)
+                except Exception:
+                    pass
+                self.watch = None
+            if self.fd is not None:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
+            if self.manager is not None and self.registered:
+                try:
+                    self.manager.UnregisterProfile(PROFILE_PATH_GFPS, timeout=3)
+                except Exception:
+                    pass
+                self.registered = False
+
+        def start(self):
+            objs = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager").GetManagedObjects()
+            dev_path = None
+            for path, ifaces in objs.items():
+                d = ifaces.get("org.bluez.Device1")
+                if d and str(d.get("Address", "")).upper() == address.upper():
+                    dev_path = str(path)
+                    break
+            if not dev_path:
+                return self.finish(1, busy=True, err="Device not found on BlueZ")
+
+            self.device = dbus.Interface(bus.get_object("org.bluez", dev_path), "org.bluez.Device1")
+            self.manager = dbus.Interface(bus.get_object("org.bluez", "/org/bluez"), "org.bluez.ProfileManager1")
+            try:
+                self.manager.UnregisterProfile(PROFILE_PATH_GFPS, timeout=1)
+            except Exception:
+                pass
+            try:
+                self.manager.RegisterProfile(PROFILE_PATH_GFPS, uuid, {
+                    "Name": "Omarchy Headphones Fast Pair",
+                    "Role": "client",
+                    "RequireAuthentication": dbus.Boolean(False),
+                    "RequireAuthorization": dbus.Boolean(False),
+                }, timeout=5)
+            except Exception as exc:
+                return self.finish(1, busy=True, err=str(exc))
+
+            self.registered = True
+            GLib.timeout_add(400, self.connect_profile, 0)
+            return False
+
+        def connect_profile(self, attempt):
+            if self.exit_code is not None or self.fd is not None:
+                return False
+
+            def on_err(err):
+                if self.exit_code is not None or self.fd is not None:
+                    return
+                if attempt + 1 < 6:
+                    GLib.timeout_add(1200, self.connect_profile, attempt + 1)
+                else:
+                    self.finish(1, busy=True, err=str(err))
+
+            try:
+                self.device.ConnectProfile(uuid, reply_handler=lambda: None, error_handler=on_err, timeout=20)
+            except Exception as exc:
+                on_err(exc)
+            return False
+
+        def opened(self, fd):
+            if self.fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                return
+            self.fd = fd
+            self.watch = GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.on_io)
+            emit(gfps_build_line(self.state))
+
+        def on_io(self, _fd, cond):
+            if cond & (GLib.IO_HUP | GLib.IO_ERR):
+                self.finish(1)
+                return False
+            try:
+                data = os.read(self.fd, 4096)
+            except OSError:
+                self.finish(1)
+                return False
+            if not data:
+                self.finish(1)
+                return False
+            frames, self.buffer = gfps_feed_data(self.buffer, data)
+            if frames:
+                for grp, code, payload in frames:
+                    gfps_parse_frame(grp, code, payload, self.state)
+                emit(gfps_build_line(self.state))
+            return self.exit_code is None
+
+        def on_stdin(self, _fd, cond):
+            if cond & (GLib.IO_HUP | GLib.IO_ERR):
+                self.finish(0)
+                return False
+            try:
+                chunk = os.read(0, 1024)
+            except OSError:
+                self.finish(0)
+                return False
+            if not chunk:
+                self.finish(0)
+                return False
+            self.pending_stdin += chunk.decode("utf-8", errors="ignore")
+            while "\n" in self.pending_stdin:
+                line, self.pending_stdin = self.pending_stdin.split("\n", 1)
+                self.handle_cmd(line)
+            return True
+
+        def handle_cmd(self, line):
+            parts = line.strip().split()
+            if not parts:
+                return
+            cmd = parts[0].lower()
+            if cmd == "ring" and self.fd is not None:
+                target = parts[1].lower() if len(parts) > 1 else "both"
+                mask = 0x03
+                if target in ("off", "stop", "silence", "0"):
+                    mask = 0x00
+                elif target == "left":
+                    mask = 0x02
+                elif target == "right":
+                    mask = 0x01
+                pkt = gfps_encode(GFPS_GROUP_DEVICE_ACTION, GFPS_ACTION_RING, bytes([mask]))
+                try:
+                    os.write(self.fd, pkt)
+                except OSError:
+                    self.finish(1)
+
+    session = GfpsSession()
+
+    class GfpsProfile(dbus.service.Object):
+        @dbus.service.method("org.bluez.Profile1", in_signature="", out_signature="")
+        def Release(self):
+            session.finish(1)
+
+        @dbus.service.method("org.bluez.Profile1", in_signature="oha{sv}", out_signature="")
+        def NewConnection(self, path, fd, properties):
+            session.opened(fd.take())
+
+        @dbus.service.method("org.bluez.Profile1", in_signature="o", out_signature="")
+        def RequestDisconnection(self, path):
+            session.finish(1)
+
+    GfpsProfile(bus, PROFILE_PATH_GFPS)
+    GLib.io_add_watch(0, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, session.on_stdin)
+    session.start()
+
+    try:
+        if session.exit_code is None:
+            loop.run()
+    finally:
+        session.cleanup()
+    sys.exit(session.exit_code or 0)
+
+
+def selftest():
+    # Verify Sony MDR v1 framing & decode (WH-1000XM4)
+    pkt = sony_encode(DATA_MDR, 0, bytes([NCASM_RET, 0x02, 0x01, 0x01, 0x00, 0x01, 0x01, 12]))
+    dec = sony_decode(pkt)
+    assert dec is not None
+    st = sony_parse_ncasm(dec[2])
+    assert st["mode"] == "ambient" and st["level"] == 12 and st["voice"] is True, st
+
+    # Verify Sony MDR Hardware EQ build & parse
+    eq_set = sony_build_eq_frame(EQ_INQUIRED_PRESET, "bass", 7, [4, 1, 0, -2, 3])
+    assert eq_set == bytes([EQEBB_SET_PARAM, EQ_INQUIRED_PRESET, 0x16, 6, 17, 14, 11, 10, 8, 13]), eq_set
+    eq_ret_pkt = sony_encode(DATA_MDR, 1, bytes([EQEBB_RET_PARAM, EQ_INQUIRED_PRESET, 0x16, 6, 17, 14, 11, 10, 8, 13]))
+    eq_dec = sony_decode(eq_ret_pkt)
+    assert eq_dec is not None
+    eq_parsed = sony_parse_eq(eq_dec[2])
+    assert eq_parsed["preset"] == "bass" and eq_parsed["clearBass"] == 7 and eq_parsed["bands"] == [4, 1, 0, -2, 3], eq_parsed
+
+    # Verify Apple AAP parsing (AirPods Pro 2)
+    aap_state = {
+        "address": "AA:BB:CC:11:22:33", "name": "AirPods Pro", "model": "A3047", "form": "earbuds",
+        "mode": None, "battery": {"perBud": True, "hasCase": True}, "charging": {},
+        "ear": None, "ca": None, "onebud": None, "adaptive_level": 50
+    }
+    aap_parse_packet(bytes.fromhex("04000400040003020150020104014b02010801280101"), aap_state)
+    assert aap_state["battery"]["right"] == 80 and aap_state["battery"]["left"] == 75 and aap_state["battery"]["case"] == 40
+    assert aap_state["charging"]["case"] is True
+    aap_parse_packet(bytes.fromhex("0400040009000d04000000"), aap_state)
+    assert aap_state["mode"] == "adaptive"
+
+    # Verify Google Fast Pair (GFPS) framing & battery parsing
+    gfps_state = {
+        "address": "24:28:FD:88:99:AA", "name": "Pixel Buds Pro", "brand": "Google", "form": "earbuds",
+        "battery": {"single": None, "left": None, "right": None, "case": None, "perBud": True, "hasCase": True},
+        "charging": {"single": False, "left": False, "right": False, "case": False},
+        "model_id": "", "ble_address": ""
+    }
+    # 1. Test 3-byte battery stream (Left: 90% discharging, Right: 85% charging [0x80|85 = 0xD5], Case: disconnected [0x7F])
+    battery_pkt = gfps_encode(GFPS_GROUP_DEVICE_INFO, GFPS_CODE_BATTERY, bytes([90, 0x80 | 85, 0x7F]))
+    frames, rem = gfps_feed_data(bytearray(), battery_pkt)
+    assert len(frames) == 1 and len(rem) == 0
+    grp, code, payload = frames[0]
+    gfps_parse_frame(grp, code, payload, gfps_state)
+    assert gfps_state["battery"]["left"] == 90 and gfps_state["charging"]["left"] is False
+    assert gfps_state["battery"]["right"] == 85 and gfps_state["charging"]["right"] is True
+    assert gfps_state["battery"]["case"] is None and gfps_state["charging"]["case"] is False
+    assert gfps_state["battery"]["perBud"] is True
+
+    # 2. Test 1-byte battery stream (e.g. over-ear Fast Pair: 70% charging [0x80|70 = 0xC6])
+    overear_pkt = gfps_encode(GFPS_GROUP_DEVICE_INFO, GFPS_CODE_BATTERY, bytes([0x80 | 70]))
+    frames, _ = gfps_feed_data(bytearray(), overear_pkt)
+    gfps_parse_frame(frames[0][0], frames[0][1], frames[0][2], gfps_state)
+    assert gfps_state["battery"]["single"] == 70 and gfps_state["charging"]["single"] is True
+    assert gfps_state["battery"]["perBud"] is False
+
+    # 3. Test Model ID and BLE Address frames
+    model_pkt = gfps_encode(GFPS_GROUP_DEVICE_INFO, GFPS_CODE_MODEL_ID, bytes.fromhex("F359AA"))
+    frames, _ = gfps_feed_data(bytearray(), model_pkt)
+    gfps_parse_frame(frames[0][0], frames[0][1], frames[0][2], gfps_state)
+    assert gfps_state["model_id"] == "F359AA"
+
+    ble_pkt = gfps_encode(GFPS_GROUP_DEVICE_INFO, GFPS_CODE_BLE_ADDRESS, bytes([0x24, 0x28, 0xFD, 0x88, 0x99, 0xAA]))
+    frames, _ = gfps_feed_data(bytearray(), ble_pkt)
+    gfps_parse_frame(frames[0][0], frames[0][1], frames[0][2], gfps_state)
+    assert gfps_state["ble_address"] == "24:28:FD:88:99:AA"
+
+    print("headphone-bridge selftest ok")
+    return 0
+
+
+def main():
+    arm_parent_death_signal()
+    args = sys.argv[1:]
+    if args and args[0] == "selftest":
+        sys.exit(selftest())
+
+    driver = ""
+    address = ""
+    uuid = SONY_UUID_V1
+    name = ""
+    i = 0
+    while i < len(args):
+        if args[i] == "--driver" and i + 1 < len(args):
+            driver = args[i + 1].strip().lower()
+            i += 2
+        elif args[i] == "--address" and i + 1 < len(args):
+            address = args[i + 1].strip()
+            i += 2
+        elif args[i] == "--uuid" and i + 1 < len(args):
+            uuid = args[i + 1].strip()
+            i += 2
+        elif args[i] == "--name" and i + 1 < len(args):
+            name = args[i + 1].strip()
+            i += 2
+        elif args[i] == "--":
+            i += 1
+        else:
+            i += 1
+
+    if not ADDRESS_RE.match(address):
+        emit({"connected": False, "error": "Invalid Bluetooth address"})
+        sys.exit(4)
+
+    if driver == "airpods":
+        run_airpods(address, name)
+    elif driver == "sony":
+        if not UUID_RE.match(uuid):
+            uuid = SONY_UUID_V1
+        run_sony(address, uuid, name)
+    elif driver == "gfps":
+        if not UUID_RE.match(uuid):
+            uuid = GFPS_UUID
+        run_gfps(address, uuid, name)
+    else:
+        sys.exit(3)
+
+
+if __name__ == "__main__":
+    main()

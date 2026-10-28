@@ -1,0 +1,12 @@
+# Dependencies & caches
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Operating system artifacts
+.DS_Store
+Thumbs.db
+*~
+*.swp

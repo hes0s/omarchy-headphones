@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "id": "eh0.headphones",
+  "name": "Headphones",
+  "version": "1.0.0",
+  "author": "eh0",
+  "description": "Battery levels, noise control, hardware EQ, codec switching, and volume/mic strip for Bluetooth headphones, Sony MDR, and AirPods",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Headphones",
+    "description": "Battery first, segmented noise control for Sony, AirPods, and Bluetooth headsets",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaults": {
+      "showBattery": true,
+      "hideWhenDisconnected": true,
+      "lowThreshold": 15,
+      "notifyLow": true,
+      "earBehavior": "One out"
+    },
+    "schema": [
+      {
+        "key": "showBattery",
+        "type": "enum",
+        "label": "Show battery percent",
+        "defaultValue": "true",
+        "options": ["true", "false"]
+      },
+      {
+        "key": "hideWhenDisconnected",
+        "type": "enum",
+        "label": "Hide when nothing is connected",
+        "defaultValue": "true",
+        "options": ["true", "false"]
+      },
+      {
+        "key": "lowThreshold",
+        "type": "integer",
+        "label": "Low battery warning (%)",
+        "min": 5,
+        "max": 40,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "notifyLow",
+        "type": "enum",
+        "label": "Notify on low battery",
+        "defaultValue": "true",
+        "options": ["true", "false"]
+      },
+      {
+        "key": "earBehavior",
+        "type": "enum",
+        "label": "Pause when taken off",
+        "defaultValue": "One out",
+        "options": ["One out", "Both out", "Never"]
+      }
+    ]
+  }
+}
