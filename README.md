@@ -62,7 +62,7 @@ Install directly into Omarchy using the `omarchy` CLI:
 omarchy plugin add https://github.com/hes0s/omarchy-headphones.git --enable
 ```
 
-### Marketplace (Once Approved)
+### Marketplace
 ```bash
 omarchy plugin add eh0.headphones --enable
 ```
