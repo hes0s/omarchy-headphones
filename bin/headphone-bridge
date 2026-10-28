@@ -284,6 +284,9 @@ def run_airpods(address, name):
 
 HDR, TRL, ESC, MASK = 0x3E, 0x3C, 0x3D, 0xEF
 DATA_MDR, DATA_MDR_NO2, ACK = 0x0C, 0x0E, 0x01
+MAX_MDR_FRAME_SIZE = 1024
+MAX_MDR_BUFFER_SIZE = 4096
+INACTIVITY_TIMEOUT_SEC = 180
 CONNECT_RET_PROTOCOL_INFO = 0x01
 EQEBB_GET_PARAM, EQEBB_RET_PARAM, EQEBB_SET_PARAM, EQEBB_NTFY_PARAM = 0x56, 0x57, 0x58, 0x59
 EQ_INQUIRED_PRESET = 0x01
@@ -525,11 +528,31 @@ def run_sony(address, uuid, name):
             self.pending_stdin = ""
             self.pending_cmds = []
             self.exit_code = None
+            self.inactivity_source = None
+
+        def reset_inactivity_watchdog(self):
+            if self.inactivity_source is not None:
+                try:
+                    GLib.source_remove(self.inactivity_source)
+                except Exception:
+                    pass
+            self.inactivity_source = GLib.timeout_add_seconds(INACTIVITY_TIMEOUT_SEC, self.on_inactivity_timeout)
+
+        def on_inactivity_timeout(self):
+            self.inactivity_source = None
+            self.finish(1, busy=True, err="Sony connection timed out (no response)")
+            return False
 
         def finish(self, code, busy=False, err=""):
             if self.exit_code is not None:
                 return False
             self.exit_code = code
+            if self.inactivity_source is not None:
+                try:
+                    GLib.source_remove(self.inactivity_source)
+                except Exception:
+                    pass
+                self.inactivity_source = None
             if busy or err:
                 emit({
                     "connected": True,
@@ -546,6 +569,12 @@ def run_sony(address, uuid, name):
             return False
 
         def cleanup(self):
+            if self.inactivity_source is not None:
+                try:
+                    GLib.source_remove(self.inactivity_source)
+                except Exception:
+                    pass
+                self.inactivity_source = None
             if self.watch is not None:
                 try:
                     GLib.source_remove(self.watch)
@@ -618,6 +647,7 @@ def run_sony(address, uuid, name):
                     pass
                 return
             self.fd = fd
+            self.reset_inactivity_watchdog()
             self.watch = GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.on_io)
             self.send_init(1)
 
@@ -680,24 +710,39 @@ def run_sony(address, uuid, name):
                 self.finish(1)
                 return False
             try:
-                data = os.read(self.fd, 4096)
+                data = os.read(self.fd, 1024)
             except OSError:
                 self.finish(1)
                 return False
             if not data:
                 self.finish(1)
                 return False
+            self.reset_inactivity_watchdog()
             self.buffer += data
+            # Hard limit total buffer size: if accumulating beyond MAX_MDR_BUFFER_SIZE, trim leading bytes
+            if len(self.buffer) > MAX_MDR_BUFFER_SIZE:
+                self.buffer = self.buffer[-MAX_MDR_FRAME_SIZE:]
             while True:
                 start = self.buffer.find(HDR)
                 if start < 0:
                     self.buffer.clear()
                     break
-                end = self.buffer.find(TRL, start + 1)
-                if end < 0:
+                if start > 0:
                     del self.buffer[:start]
+                    start = 0
+                end = self.buffer.find(TRL, 1)
+                if end < 0:
+                    # Incomplete frame starting with HDR has no TRL yet.
+                    # Bound frame size: if incomplete frame exceeds MAX_MDR_FRAME_SIZE without TRL,
+                    # discard leading HDR so the buffer never grows unbounded.
+                    if len(self.buffer) > MAX_MDR_FRAME_SIZE:
+                        del self.buffer[:1]
                     break
-                frame = bytes(self.buffer[start:end + 1])
+                if end + 1 > MAX_MDR_FRAME_SIZE:
+                    # Oversized frame between HDR and TRL; discard leading HDR
+                    del self.buffer[:1]
+                    continue
+                frame = bytes(self.buffer[:end + 1])
                 del self.buffer[:end + 1]
                 self.on_frame(frame)
             return self.exit_code is None
@@ -826,6 +871,8 @@ def run_sony(address, uuid, name):
                 self.finish(0)
                 return False
             self.pending_stdin += chunk.decode("utf-8", errors="ignore")
+            if len(self.pending_stdin) > 4096:
+                self.pending_stdin = self.pending_stdin[-1024:]
             while "\n" in self.pending_stdin:
                 line, self.pending_stdin = self.pending_stdin.split("\n", 1)
                 self.handle_cmd(line)
@@ -980,11 +1027,14 @@ def gfps_parse_frame(group, code, payload, state):
 
 
 def gfps_feed_data(buffer, chunk):
-    buf = buffer + chunk
+    buf = (buffer + chunk)[:4096]
     frames = []
     while len(buf) >= 4:
         group, code = buf[0], buf[1]
         length = struct.unpack(">H", buf[2:4])[0]
+        if length > 1024:
+            buf = buf[1:]
+            continue
         if len(buf) < 4 + length:
             break
         payload = bytes(buf[4:4 + length])
@@ -1194,6 +1244,8 @@ def run_gfps(address, uuid, name):
                 self.finish(0)
                 return False
             self.pending_stdin += chunk.decode("utf-8", errors="ignore")
+            if len(self.pending_stdin) > 4096:
+                self.pending_stdin = self.pending_stdin[-1024:]
             while "\n" in self.pending_stdin:
                 line, self.pending_stdin = self.pending_stdin.split("\n", 1)
                 self.handle_cmd(line)
@@ -1265,6 +1317,13 @@ def selftest():
     eq_parsed = sony_parse_eq(eq_dec[2])
     assert eq_parsed["preset"] == "bass" and eq_parsed["clearBass"] == 7 and eq_parsed["bands"] == [4, 1, 0, -2, 3], eq_parsed
 
+    # Verify buffer bounds protection against malicious/unbounded stream without TRL
+    test_buf = bytearray([HDR]) + b"A" * 5000
+    # Simulate processing of oversize stream starting with HDR but lacking TRL
+    if len(test_buf) > MAX_MDR_BUFFER_SIZE:
+        test_buf = test_buf[-MAX_MDR_FRAME_SIZE:]
+    assert len(test_buf) <= MAX_MDR_FRAME_SIZE, len(test_buf)
+
     # Verify Apple AAP parsing (AirPods Pro 2)
     aap_state = {
         "address": "AA:BB:CC:11:22:33", "name": "AirPods Pro", "model": "A3047", "form": "earbuds",
@@ -1318,6 +1377,11 @@ def selftest():
 
 
 def main():
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (128 * 1024 * 1024, 128 * 1024 * 1024))
+    except Exception:
+        pass
     arm_parent_death_signal()
     args = sys.argv[1:]
     if args and args[0] == "selftest":

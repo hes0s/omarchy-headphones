@@ -360,7 +360,18 @@ Item {
       }
     }
     stdout: SplitParser {
+      property int lineCountInSec: 0
+      property real lastSecReset: 0
+
       onRead: function(line) {
+        var now = Date.now()
+        if (now - lastSecReset > 1000) {
+          lastSecReset = now
+          lineCountInSec = 0
+        }
+        lineCountInSec++
+        if (lineCountInSec > 40) return // Ingress rate limit: max 40 lines/sec
+
         var safeLine = String(line || "").slice(0, 4096)
         var prev = root.bridgeState || {}
         var prevWorn = prev.worn
@@ -394,6 +405,34 @@ Item {
     onTriggered: {
       root.bridgeBackingOff = false
     }
+  }
+
+  // ---- Process Resource & Lifetime Watchdog
+  Timer {
+    id: bridgeWatchdogTimer
+    interval: 30000 // every 30 seconds
+    repeat: true
+    running: bridgeProcess.running
+    property int uptimeSeconds: 0
+    onTriggered: {
+      uptimeSeconds += 30
+      // 1. Terminate helper immediately if headset disconnected
+      if (!root.bridgeWanted) {
+        uptimeSeconds = 0
+        if (bridgeProcess.running) bridgeProcess.terminate()
+        return
+      }
+      // 2. Maximum lifetime recycling: after 4 hours of continuous operation,
+      // cleanly recycle helper to ensure heap and kernel descriptors remain bounded
+      if (uptimeSeconds >= 14400) {
+        uptimeSeconds = 0
+        if (bridgeProcess.running) bridgeProcess.terminate()
+      }
+    }
+  }
+
+  Component.onDestruction: {
+    if (bridgeProcess.running) bridgeProcess.kill()
   }
 
   // ---- Effective State (combines debugFixture, bridgeState, or BlueZ fallback)

@@ -195,4 +195,16 @@ assert.strictEqual(mergedAudioState.outputVolume, 0.65)
 assert.strictEqual(mergedAudioState.outputMuted, true)
 assert.strictEqual(mergedAudioState.micMuted, false)
 
+// 16. Ingress line bounds & sanitization
+const oversizedPayload = JSON.stringify({ connected: true, name: "A".repeat(500), error: "B".repeat(500) })
+const safeMerge = Model.mergeBridgeLine({}, oversizedPayload)
+assert.strictEqual(safeMerge.connected, true)
+assert.ok(safeMerge.name.length <= 128)
+assert.ok(safeMerge.error.length <= 256)
+
+// Invalid truncated JSON falls back gracefully without throwing
+const truncated = oversizedPayload.slice(0, 50)
+const fallback = Model.mergeBridgeLine({ connected: true }, truncated)
+assert.strictEqual(fallback.connected, true)
+
 console.log("All Model.js unit tests passed!")
