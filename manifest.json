@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "eh0.headphones",
   "name": "Headphones",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "eh0",
-  "description": "Battery levels, noise control, hardware EQ, codec switching, and volume/mic strip for Bluetooth headphones, Sony MDR, and AirPods",
+  "description": "Unified headphone companion: live battery telemetry, segmented noise control (ANC/Ambient), 5-band hardware EQ, and PipeWire codec switching for Sony WH/WF, Apple AirPods, and Bluetooth audio.",
   "kinds": [
     "service",
     "bar-widget"
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "Headphones",
-    "description": "Battery first, segmented noise control for Sony, AirPods, and Bluetooth headsets",
+    "description": "Live battery gauge, segmented noise control (ANC/Ambient), hardware EQ, and quick audio strip",
     "category": "Audio",
     "allowMultiple": false,
     "defaults": {
